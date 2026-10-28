@@ -24,7 +24,8 @@ pub fn shape(rows: &[String], media: OutMedia) -> Result<Shaped, ApiError> {
             Ok(Shaped { content_type: "application/json; charset=utf-8", body })
         }
         OutMedia::Object => {
-            if rows.len() > 1 {
+            // PostgREST: singular object requires exactly one row, else 406 PGRST116
+            if rows.len() > 1 || rows.is_empty() {
                 return Err(ApiError::multiple_objects());
             }
             let body = rows.first().cloned().unwrap_or_else(|| "null".to_string());
@@ -38,11 +39,14 @@ pub fn shape(rows: &[String], media: OutMedia) -> Result<Shaped, ApiError> {
             for r in rows {
                 parsed.push(serde_json::from_str(r).map_err(|e| ApiError::internal(e.to_string()))?);
             }
+            // union of keys across rows, first-seen order (rows may differ)
             let mut cols: Vec<String> = Vec::new();
-            if let Some(first) = parsed.first() {
-                if let Some(obj) = first.as_object() {
-                    for k in obj.keys() {
-                        cols.push(k.clone());
+            for obj in &parsed {
+                if let Some(m) = obj.as_object() {
+                    for k in m.keys() {
+                        if !cols.contains(k) {
+                            cols.push(k.clone());
+                        }
                     }
                 }
             }
@@ -70,13 +74,21 @@ pub fn shape(rows: &[String], media: OutMedia) -> Result<Shaped, ApiError> {
 }
 
 pub fn shape_scalar_text(rows: &[Vec<Option<String>>], cols: &[String]) -> Shaped {
-    // scalar text RPC: single column
+    // scalar text RPC: single "row" column
     let idx = cols.iter().position(|c| c == "row").unwrap_or(0);
-    let v = rows
-        .first()
-        .and_then(|r| r.get(idx))
-        .cloned()
-        .flatten()
-        .unwrap_or_default();
-    Shaped { content_type: "text/plain; charset=utf-8", body: v }
+    let vals: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get(idx).cloned().flatten())
+        .collect();
+    if vals.len() > 1 {
+        // bulk scalar calls come back as a JSON array of strings
+        let body = vals
+            .iter()
+            .map(|v| serde_json::json!(v).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Shaped { content_type: "application/json; charset=utf-8", body: format!("[{}]", body) }
+    } else {
+        Shaped { content_type: "text/plain; charset=utf-8", body: vals.into_iter().next().unwrap_or_default() }
+    }
 }

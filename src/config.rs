@@ -11,6 +11,7 @@ pub struct Config {
     pub db_pre_config: Option<String>,
     pub db_config: bool, // read postgrest.config table
     pub jwt_secret: Option<Vec<u8>>,
+    pub jwks_url: Option<String>,
     pub server_host: String,
     pub server_port: u16,
     pub db_tx_end_default: TxEnd,
@@ -45,6 +46,7 @@ impl Config {
             db_pre_config: envs(&["PGRST_DB_PRE_CONFIG"]),
             db_config: envs(&["PGRST_DB_CONFIG"]).map(|v| v == "true").unwrap_or(false),
             jwt_secret: envs(&["PGRST_JWT_SECRET"]).map(|s| s.into_bytes()),
+            jwks_url: envs(&["PGRST_JWKS_URL"]),
             server_host: envs(&["PGRST_SERVER_HOST"]).unwrap_or_else(|| "0.0.0.0".into()),
             server_port: envs(&["PGRST_SERVER_PORT"])
                 .and_then(|v| v.parse().ok())
@@ -84,6 +86,7 @@ impl Config {
                 "db-pre-request" => self.db_pre_request = if setting.is_empty() { None } else { Some(setting) },
                 "db-pre-config" => self.db_pre_config = if setting.is_empty() { None } else { Some(setting) },
                 "jwt-secret" => self.jwt_secret = Some(setting.into_bytes()),
+                "jwks-url" => self.jwks_url = if setting.is_empty() { None } else { Some(setting) },
                 "server-port" => {
                     if let Ok(n) = setting.parse() {
                         self.server_port = n;

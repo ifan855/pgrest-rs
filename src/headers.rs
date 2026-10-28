@@ -74,13 +74,16 @@ pub struct RangeHdr {
     pub last: Option<i64>,
 }
 
-pub fn parse_range(h: Option<&str>) -> Result<Option<RangeHdr>, String> {
+pub fn parse_range(h: Option<&str>, unit: Option<&str>) -> Result<Option<RangeHdr>, String> {
     let Some(h) = h else { return Ok(None) };
     let h = h.trim();
-    let Some((unit, spec)) = h.split_once('=') else {
-        return Err(format!("invalid Range header '{}'", h));
+    // Two accepted forms: `Range: items=0-14` and, with `Range-Unit: items`,
+    // the bare `Range: 0-14`.
+    let (unit_name, spec) = match h.split_once('=') {
+        Some((u, s)) => (u.trim().to_string(), s.trim().to_string()),
+        None => (unit.unwrap_or("items").trim().to_string(), h.to_string()),
     };
-    if unit.trim() != "items" {
+    if unit_name != "items" {
         // Unrecognized range unit: ignore it per RFC, PostgREST does the same.
         return Ok(None);
     }

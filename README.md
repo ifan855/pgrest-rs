@@ -29,56 +29,72 @@ cargo run --release
 Docker-style single binary: `target/release/pgrest-rs` (static-ish, musl
 build supported: `cargo build --release --target x86_64-unknown-linux-musl`).
 
-## Feature matrix (vs PostgREST)
+## What is implemented
 
-### Core (Tier 1) — implemented
-
-- **Auto REST API** for every table / view / materialized view in the exposed
-  schemas: `GET`, `POST`, `PATCH`, `DELETE` on `/schema/table`
-- **Vertical filtering**: `select=id,title,rating::text,aliased:year,data->>key`
+- **Auto REST API** for every table, view, materialized view, partitioned and
+  foreign table in the exposed schemas: `GET`, `POST`, `PATCH`, `PUT`, `DELETE`
+  on `/schema/table`
+- **Vertical filtering**: `select=id,title,rating::text,aliased:year,data->>key`,
+  spreads (`select=*`, `select=*,embed(...)`), aliases, casts and JSON arrows
 - **Filter operators**: `eq neq gt gte lt lte like ilike match imatch in is
   isdistinct cs cd ov sl sr nxl nxr adj fts plfts phfts websearch`, plus
   `and=(...)` / `or=(...)` blocks, `not.` negation and `col=not.eq.x`
   (with `*` to `%` translation for like/ilike)
-- **Ordering**: multi-key, `asc/desc`, `nullsfirst/nullslast`
+- **Ordering**: multi-key, `asc/desc`, `nullsfirst/nullslast`; grammar errors
+  (unknown order keywords, negative limit/offset) are rejected as `PGRST100`
 - **Pagination**: `limit/offset`, HTTP `Range: items=0-14` (implies exact
-  count), `Content-Range` responses, `206 Partial Content`, `416` on
-  unsatisfiable ranges, `Prefer: count=exact|estimated|none`,
-  `Content-Location` canonical URLs
-- **Resource embedding** (the crown jewel):
+  count) and the `Range` + `Range-Unit: items` form, `Content-Range`
+  responses, `206 Partial Content`, `416` on unsatisfiable ranges,
+  `Prefer: count=exact|planned|estimated|none`, canonical `Content-Location`
+- **Resource embedding**:
   - one-to-many, many-to-one, one-to-one (unique FK), many-to-many through
     auto-detected join tables
-  - arbitrarily nested embeds, `!inner` joins, aliases
+  - **computed relationships**: `fn(parent) returns setof child` functions
+    exposed as embed relations
+  - arbitrarily nested embeds, `!inner` and `!left` hints, aliases
     (`director:directors!director_id`), disambiguation hints
     (`films!director_id`, `films!constraint_name`, join-table hints)
-  - embedded filters / order / limit / offset:
-    `reviews.order=stars.desc&reviews.limit=3&reviews.stars=gte.4`
+  - embedded filters / order / limit / offset, including nested paths
+    (`films.actors.name=eq.X`) and alias-keyed params
   - **aggregates on embeds**: `reviews(count)`, `reviews(sum(stars))`
-- **Top-level aggregates**: `select=count(),sum(rating),avg(rating)`
+- **Top-level aggregates**: `select=count(),sum(rating),avg(rating)` with
+  automatic `GROUP BY` when mixed with plain columns, aggregate aliases and
+  casts (`total:count()::text`), typed JSON output
 - **Mutations**: single + bulk JSON insert, **CSV upload** (`Content-Type:
   text/csv`), `?columns=`, **upsert** (`Prefer: resolution=merge-duplicates /
   ignore-duplicates` + `?on_conflict=`), `Prefer: missing=default`,
-  `Prefer: return=representation|minimal`, `Location` header on insert
+  `Prefer: return=representation|minimal`, `Location` header on insert,
+  **PUT upsert-by-primary-key**, and `select=` on any mutation to shape (and
+  embed into) the returned rows
 - **RPC**: every tracked function at `/rpc/<fn>`; POST (+GET for non-volatile),
-  named args from JSON body / query params, default args, return-shape mapping
-  (void→204, scalar→text, json→json, setof/composite→array)
-- **Auth (PostgREST model)**: JWT HS256 → `role` claim → `SET LOCAL ROLE` +
-  claims as GUCs (`request.jwt.claims`, `request.jwt.claim.<key>`,
-  `request.method`, `request.path`) → **Row Level Security does the authz**.
-  Anonymous requests run as `db-anon-role`.
-- **OpenAPI 2.0** at `/`, generated from the schema cache
-- **Media negotiation**: JSON (default), `text/csv` output,
-  `application/vnd.pgrst.object+json` (singular, 406 `PGRST116` on multiple)
+  named args from JSON body and/or query string, default args, **function
+  overloads resolved by provided arguments** (`PGRST203` on ambiguity),
+  **procedures via `CALL`** (POST-only), return-shape mapping (void→204,
+  scalar→text/json, composite→object, setof/table→array),
+  `select`/`order`/`limit`/`offset` and filters on setof results, and bulk
+  calls with `Prefer: params=multiple-objects`
+- **Auth (PostgREST model)**: JWT **HS256** (shared secret) and **RS256**
+  (keys fetched from `PGRST_JWKS_URL`, `kid` matching, `oct` keys supported)
+  → `role` claim → `SET LOCAL ROLE` + claims as GUCs (`request.jwt.claims`,
+  `request.jwt.claim.<key>`, `request.method`, `request.path`) → **Row Level
+  Security does the authz**. Anonymous requests run as `db-anon-role`;
+  tokens are ignored when no key is configured.
+- **Multi-schema profiles**: `Accept-Profile` (reads) and `Content-Profile`
+  (writes) narrow the request to one exposed schema
+- **OpenAPI 2.0** at `/`, generated from the schema cache with per-column
+  filter-operator documentation, PUT operations and procedure paths
+- **Media negotiation**: JSON (default), `text/csv` output (union of keys
+  across rows), `application/vnd.pgrst.object+json` (singular; 406
+  `PGRST116` on zero or multiple rows)
 - **Errors**: PGRST-style JSON errors with codes (`PGRST100` parse,
-  `PGRST118` unknown relation, `PGRST201` ambiguous embed, `PGRST202` unknown
-  function, `PG23505` unique violation → 409, `PG42501` → 403, ...)
-- **Schema cache**: one introspection pass over `pg_catalog`, hot-reloaded via
-  `NOTIFY pgrst, 'reload schema'`
+  `PGRST118` unknown relation, `PGRST201`/`PGRST203` ambiguity, `PGRST202`
+  unknown function, `PG23505` unique violation → 409, `PG42501` → 403, ...)
+  and `Allow` headers on 405s
+- **Schema cache**: one introspection pass over `pg_catalog` (tables, views,
+  constraints, functions, procedures, enums, computed relationships),
+  hot-reloaded via `NOTIFY pgrst, 'reload schema'`
 - **CORS** on every response + OPTIONS preflight
 - `db-max-rows` server-side cap
-
-### Ops (Tier 2) — implemented
-
 - **Admin endpoints**: `/admin/live`, `/admin/ready`, `/admin/metrics`
   (Prometheus text format: request counters by status, latency histogram,
   pool gauges, resident RSS)
@@ -91,20 +107,19 @@ build supported: `cargo build --release --target x86_64-unknown-linux-musl`).
   request transaction before the statement (custom auth, auditing, ...)
 - **Config**: file-less, 12-factor env vars with PostgREST-compatible names
 
-### Deliberately out of scope (same as PostgREST)
+### Deliberately out of scope
 
 Rate limiting, caching/ETags, migrations, admin UI, GraphQL, file storage.
 This is a translator, not an application server.
 
-### Known gaps (honesty section)
+### Known gaps
 
-- JWT: HS256 only (no RS256/JWKS yet)
-- `count=planned` approximated with `reltuples` estimates
-- `Prefer: params=multiple-objects` (bulk procedures) not implemented
-- Computed relationships (functions over table types) not exposed as embeds
 - Responses are buffered per request (bounded by `db-max-rows`); row-streaming
   off the wire protocol is the next performance step
-- OpenAPI output is a solid subset (no per-column filter type inference)
+- `count=planned` uses the plan's row estimate for the read query, which can
+  drift from a freshly analyzed table
+- OpenAPI output does not model per-function return shapes or embedded
+  relationship definitions
 
 ## Configuration reference
 
@@ -118,7 +133,8 @@ This is a translator, not an application server.
 | `PGRST_DB_PRE_REQUEST` | unset | Function called before every request |
 | `PGRST_DB_PRE_CONFIG` | unset | Function called on config reload |
 | `PGRST_DB_CONFIG` | `false` | Read `postgrest.config` table |
-| `PGRST_JWT_SECRET` | unset | HS256 secret; unset = tokens ignored |
+| `PGRST_JWT_SECRET` | unset | HS256 secret; unset = tokens ignored unless `PGRST_JWKS_URL` is set |
+| `PGRST_JWKS_URL` | unset | JWKS endpoint for RS256 (and `oct`) keys |
 | `PGRST_SERVER_HOST` | `0.0.0.0` | Bind host |
 | `PGRST_SERVER_PORT` | `3000` | Bind port |
 | `PGRST_DB_TX_END` | `commit` | Default tx ending |
@@ -142,8 +158,8 @@ Point `PGRST_DB_URI` at the `authenticator` role; JWTs carry `role: "authenticat
 
 ```bash
 cargo test                      # parser/compiler unit tests
-scripts/reset-db.sh             # reseed integration database (needs psql)
-scripts/integration.sh          # 70-check integration battery (needs running server)
+scripts/reset-db.sh             # (re)create + seed the integration database (needs psql)
+scripts/integration.sh          # 113-check integration battery (needs running server)
 ```
 
 Layout:
@@ -156,11 +172,11 @@ src/
   parser.rs     URL grammar -> AST (select tree, filters, order)
   ast.rs        AST types
   compiler.rs   AST -> SQL (embeds via LATERAL, count, aggregates)
-  mutate.rs     insert/update/delete/upsert/rpc compilers
+  mutate.rs     insert/update/delete/put/upsert/rpc compilers
   pg.rs         execution: pool, tx, role+GUC impersonation, LISTEN reload
   handlers.rs   HTTP dispatch, headers, status codes
   media.rs      JSON/CSV/object shaping
-  auth.rs       HS256 JWT
+  auth.rs       HS256 + RS256 (JWKS) JWT
   openapi.rs    OpenAPI 2.0 generation
   metrics.rs    Prometheus metrics
   error.rs      PGRST error model

@@ -59,6 +59,12 @@ pub fn parse_select(src: &str) -> Result<Vec<Sel>, ApiError> {
 }
 
 fn parse_sel_item(item: &str) -> Result<Sel, ApiError> {
+    // strip a trailing ::cast suffix first: applies to columns, aggregates and
+    // embed-free expressions alike (`total:count()::text`, `rating::text`).
+    let (item, outer_cast): (&str, Option<String>) = match find_outer_cast(item) {
+        Some(pos) => (&item[..pos], Some(item[pos + 2..].to_string())),
+        None => (item, None),
+    };
     // embed: name(hint-ish args) — find first top-level '('
     let bytes = item.as_bytes();
     let mut open = None;
@@ -95,30 +101,41 @@ fn parse_sel_item(item: &str) -> Result<Sel, ApiError> {
         }
         let head = &item[..open];
         let inner = &item[open + 1..item.len() - 1];
+        // split `alias:` prefix before deciding agg vs embed (`total:count()`)
+        let mut alias: Option<String> = None;
+        let mut head_work = head;
+        if let Some((a, b)) = split_first_unquoted(head, ':') {
+            if !a.is_empty() && is_ident(a) && is_ident(b.split('!').next().unwrap_or("").trim()) {
+                alias = Some(a.to_string());
+                head_work = b;
+            }
+        }
         // aggregates take priority over embeds: count(), sum(col)...
-        let fname = head.trim().to_lowercase();
+        let fname = head_work.trim().to_lowercase();
         if matches!(fname.as_str(), "count" | "sum" | "avg" | "min" | "max") {
             let arg = inner.trim();
+            // count() and count(*) are the same thing
+            let arg = if arg == "*" { None } else if arg.is_empty() { None } else { Some(arg.to_string()) };
             return Ok(Sel {
                 name: fname.clone(),
-                alias: None,
-                cast: None,
+                alias: alias.or_else(|| Some(fname.clone())),
+                cast: outer_cast,
                 json: None,
                 agg: Some(Agg {
                     func: fname,
-                    arg: if arg.is_empty() { None } else { Some(arg.to_string()) },
+                    arg,
                 }),
                 embed: None,
             });
         }
-        return parse_embed(head, inner);
+        return parse_embed(alias, head_work, inner, outer_cast);
     }
 
     // plain column with optional alias / cast / json arrow
     let mut sel = Sel {
         name: String::new(),
         alias: None,
-        cast: None,
+        cast: outer_cast,
         json: None,
         agg: None,
         embed: None,
@@ -133,13 +150,15 @@ fn parse_sel_item(item: &str) -> Result<Sel, ApiError> {
         }
     }
 
-    // cast: name::type
-    if let Some(pos) = rest.find("::") {
-        let (n, c) = rest.split_at(pos);
-        if !c[2..].is_empty() && is_ident(n) {
-            sel.name = n.to_string();
-            sel.cast = Some(c[2..].to_string());
-            return Ok(sel);
+    // cast: name::type (only when not already consumed as an outer suffix)
+    if sel.cast.is_none() {
+        if let Some(pos) = rest.find("::") {
+            let (n, c) = rest.split_at(pos);
+            if !c[2..].is_empty() && is_ident(n) {
+                sel.name = n.to_string();
+                sel.cast = Some(c[2..].to_string());
+                return Ok(sel);
+            }
         }
     }
 
@@ -156,14 +175,15 @@ fn parse_sel_item(item: &str) -> Result<Sel, ApiError> {
         }
     }
 
-    // aggregates: count() / sum(col)
+    // aggregates: count() / sum(col) (when written without parens-level parens)
     if let Some(open) = rest.find('(') {
         let fname = rest[..open].trim().to_lowercase();
         if matches!(fname.as_str(), "count" | "sum" | "avg" | "min" | "max") && rest.ends_with(')') {
             let arg = rest[open + 1..rest.len() - 1].trim();
+            let arg = if arg == "*" || arg.is_empty() { None } else { Some(arg.to_string()) };
             sel.agg = Some(Agg {
                 func: fname.clone(),
-                arg: if arg.is_empty() { None } else { Some(arg.to_string()) },
+                arg,
             });
             sel.name = fname;
             return Ok(sel);
@@ -177,16 +197,39 @@ fn parse_sel_item(item: &str) -> Result<Sel, ApiError> {
     Ok(sel)
 }
 
-fn parse_embed(head: &str, inner: &str) -> Result<Sel, ApiError> {
-    // head: rel | rel!hint | rel!inner | rel!hint!inner | alias:rel!hint...
-    let mut alias = None;
-    let mut head = head;
-    if let Some((a, b)) = split_first_unquoted(head, ':') {
-        if !a.is_empty() && is_ident(a) {
-            alias = Some(a.to_string());
-            head = b;
+/// Position of a top-level `::` cast suffix (last `::` at depth 0, outside quotes).
+fn find_outer_cast(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut in_q = false;
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_q {
+            if c == '\'' {
+                in_q = false;
+            }
+            i += 1;
+            continue;
         }
+        match c {
+            '\'' => in_q = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                found = Some(i);
+                i += 1; // skip the second colon
+            }
+            _ => {}
+        }
+        i += 1;
     }
+    found
+}
+
+fn parse_embed(alias: Option<String>, head: &str, inner: &str, _cast: Option<String>) -> Result<Sel, ApiError> {
+    // head: rel | rel!hint | rel!inner | rel!hint!inner (alias already stripped)
     let mut parts = head.split('!');
     let rel = parts.next().unwrap_or("").trim().to_string();
     if !is_ident(&rel) {
@@ -197,6 +240,7 @@ fn parse_embed(head: &str, inner: &str) -> Result<Sel, ApiError> {
     for p in parts {
         match p.trim() {
             "inner" => inner_join = true,
+            "left" => {} // the default join type, accepted as a hint
             other => hint = Some(other.to_string()),
         }
     }
@@ -308,7 +352,7 @@ pub fn parse_filters(params: &[(String, String)]) -> Result<Vec<Cond>, ApiError>
     Ok(out)
 }
 
-fn parse_cond(key: &str, val: &str) -> Result<Cond, ApiError> {
+pub fn parse_cond(key: &str, val: &str) -> Result<Cond, ApiError> {
     // two surface forms reach this function:
     //  a) top-level params:      key="year"      val="gte.2014"        (col=op.value)
     //  b) logic blocks / inner:  key="year.gt"   val="2000"            (col.op.value)
@@ -358,7 +402,7 @@ fn split_op_not(op: &str, val: &str) -> (String, String, bool) {
 
 /// Split "op.value" where op may contain parens: fts(english).value, or a
 /// negation: not.eq.value. Returns (op, value).
-fn split_op_value(v: &str) -> Option<(String, String)> {
+pub fn split_op_value(v: &str) -> Option<(String, String)> {
     // negation form: not.<op>.<value>
     if let Some(rest) = v.strip_prefix("not.") {
         let (op, val) = split_op_value(rest)?;
@@ -452,34 +496,29 @@ fn parse_group(v: &str) -> Result<Vec<Cond>, ApiError> {
 }
 
 /// Route embed-scoped params like `actors.name=eq.X`, `actors.order=...`,
-/// `actors.limit=...` into the embed nodes of the select tree.
+/// `actors.limit=...` into the embed nodes of the select tree. Supports nested
+/// paths (`films.actors.name=eq.X`) and matches on embed aliases as well as
+/// relation names.
 pub fn route_embed_params(
     select: &mut Vec<Sel>,
     params: &[(String, String)],
 ) -> Result<Vec<Cond>, ApiError> {
     let mut root_conds = Vec::new();
-    let embed_names: Vec<String> = select
-        .iter()
-        .filter_map(|s| s.embed.as_ref().map(|e| e.rel.clone()))
-        .collect();
     for (k, v) in params {
         if RESERVED.contains(&k.as_str()) {
             continue;
         }
+        // embed-scoped param: matches an embed rel/alias at the root
         if let Some((rel, rest)) = k.split_once('.') {
-            if embed_names.contains(&rel.to_string()) {
-                if let Some(sel) = select.iter_mut().find(|s| {
-                    s.embed.as_ref().map(|e| e.rel == rel).unwrap_or(false)
-                }) {
-                    let node = sel.embed.as_mut().unwrap();
-                    match rest {
-                        "order" => node.order = parse_order(v)?,
-                        "limit" => node.limit = Some(v.parse().map_err(|_| ApiError::parse(format!("invalid limit '{}'", v)))?),
-                        "offset" => node.offset = Some(v.parse().map_err(|_| ApiError::parse(format!("invalid offset '{}'", v)))?),
-                        _ => node.filters.push(parse_cond(rest, v)?),
-                    }
-                    continue;
+            let matched = match find_embed_mut(select, rel) {
+                Some(node) => {
+                    route_into_embed(node, rest, v)?;
+                    true
                 }
+                None => false,
+            };
+            if matched {
+                continue;
             }
         }
         if k == "and" || k == "or" || k.starts_with("not.") {
@@ -492,6 +531,68 @@ pub fn route_embed_params(
         }
     }
     Ok(root_conds)
+}
+
+/// Whether an embed with the given rel/alias key exists in the select list.
+fn has_embed_named(select: &[Sel], key: &str) -> bool {
+    select.iter().any(|s| {
+        s.embed
+            .as_ref()
+            .map(|e| {
+                let alias = s.alias.clone().unwrap_or_else(|| e.rel.clone());
+                e.rel == key || alias == key
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Find an embed node by relation name OR output alias (PostgREST matches
+/// scoped params against the select-tree key the user wrote).
+fn find_embed_mut<'a>(select: &'a mut [Sel], key: &str) -> Option<&'a mut EmbedNode> {
+    for s in select.iter_mut() {
+        if let Some(node) = &mut s.embed {
+            let alias = s.alias.clone().unwrap_or_else(|| node.rel.clone());
+            if node.rel == key || alias == key {
+                return Some(node.as_mut());
+            }
+        }
+    }
+    None
+}
+
+/// Apply `rest=v` (everything after `rel.`) to an embed node, recursing into
+/// sub-embeds for nested paths like `films.actors.name`.
+fn route_into_embed(node: &mut EmbedNode, rest: &str, v: &str) -> Result<(), ApiError> {
+    // nested: another rel/alias prefix that matches one of this embed's sub-embeds
+    if let Some((sub, deeper)) = rest.split_once('.') {
+        let deeper_is_scope = {
+            // "order"/"limit"/"offset" are terminal keywords, not sub-relations
+            !matches!(sub, "order" | "limit" | "offset") && has_embed_named(&node.select, sub)
+        };
+        if deeper_is_scope {
+            let sub_node = find_embed_mut(&mut node.select, sub).unwrap();
+            return route_into_embed(sub_node, deeper, v);
+        }
+    }
+    match rest {
+        "order" => node.order = parse_order(v)?,
+        "limit" => node.limit = Some(parse_nonneg(v, "limit")?),
+        "offset" => node.offset = Some(parse_nonneg(v, "offset")?),
+        _ => node.filters.push(parse_cond(rest, v)?),
+    }
+    Ok(())
+}
+
+/// Parse a non-negative integer query value (limit/offset), PostgREST-style:
+/// negatives are grammar errors, not runtime ones.
+pub fn parse_nonneg(v: &str, what: &str) -> Result<i64, ApiError> {
+    let n: i64 = v
+        .parse()
+        .map_err(|_| ApiError::parse(format!("invalid {} '{}'", what, v)))?;
+    if n < 0 {
+        return Err(ApiError::parse(format!("{} must be non-negative, got '{}'", what, v)));
+    }
+    Ok(n)
 }
 
 // ---------- order ----------
@@ -515,8 +616,12 @@ pub fn parse_order(v: &str) -> Result<Vec<OrderItem>, ApiError> {
                 "nullslast" => it.nulls = Some(Nulls::Last),
                 other => {
                     // allow json arrow continuation like data->>k
-                    it.col.push('.');
-                    it.col.push_str(other);
+                    if it.col.contains("->") {
+                        it.col.push('.');
+                        it.col.push_str(other);
+                    } else {
+                        return err(format!("unexpected '{}' in order spec '{}'", other, p));
+                    }
                 }
             }
         }

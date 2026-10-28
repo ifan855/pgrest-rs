@@ -28,6 +28,8 @@ enum JoinKind {
     Children { child_cols: Vec<String>, parent_cols: Vec<String>, one: bool },
     /// many-to-many through a join table
     Many { via: String, base_fk: (Vec<String>, Vec<String>), target_fk: (Vec<String>, Vec<String>) },
+    /// computed relationship: fn(base) returns the target rows
+    Computed { fn_schema: String, fn_name: String, setof: bool },
 }
 
 struct Candidate {
@@ -122,6 +124,25 @@ fn resolve_rel(
         }
     }
 
+    // 4. computed relationships: fn(base) -> setof/composite target
+    if let Some(rels) = cache.computed.get(&(base.schema.clone(), base.name.clone())) {
+        for cr in rels {
+            if cr.fn_name == node.rel {
+                if let Some(target) = cache.table(&cr.ret_schema, &cr.ret_table) {
+                    candidates.push(Candidate {
+                        label: cr.fn_name.clone(),
+                        target: target.clone(),
+                        kind: JoinKind::Computed {
+                            fn_schema: cr.fn_schema.clone(),
+                            fn_name: cr.fn_name.clone(),
+                            setof: cr.setof,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
     if candidates.is_empty() {
         return Err(ApiError::new(
             404,
@@ -141,6 +162,7 @@ fn resolve_rel(
             .iter()
             .filter(|c| match &c.kind {
                 JoinKind::Many { via, .. } => via == hint || c.label.contains(hint),
+                JoinKind::Computed { .. } => c.label == *hint,
                 JoinKind::Parent { child_cols, .. } | JoinKind::Children { child_cols, .. } => {
                     c.label == *hint
                         || c.label.ends_with(&format!("_{}_fkey", hint))
@@ -218,6 +240,11 @@ impl Clone for Candidate {
                     base_fk: (base_fk.0.clone(), base_fk.1.clone()),
                     target_fk: (target_fk.0.clone(), target_fk.1.clone()),
                 },
+                JoinKind::Computed { fn_schema, fn_name, setof } => JoinKind::Computed {
+                    fn_schema: fn_schema.clone(),
+                    fn_name: fn_name.clone(),
+                    setof: *setof,
+                },
             },
         }
     }
@@ -267,6 +294,19 @@ fn build_embed(
 
     // FROM + FK join condition for the lateral's inner query
     let (from_clause, fk_where): (String, String) = match &cand.kind {
+        JoinKind::Computed { fn_schema, fn_name, .. } => {
+            // function-in-FROM is implicitly LATERAL: `base_alias` is visible
+            (
+                format!(
+                    "{}.{}({}) AS {}",
+                    qi(fn_schema),
+                    qi(fn_name),
+                    qi(base_alias),
+                    qi(&inner_alias)
+                ),
+                "true".to_string(),
+            )
+        }
         JoinKind::Parent { child_cols, parent_cols } => {
             let mut conds = Vec::new();
             for (cc, pc) in child_cols.iter().zip(parent_cols.iter()) {
@@ -348,19 +388,30 @@ fn build_embed(
 
     // aggregate-only embed: rel(count) / rel(sum(col))
     let agg_sels: Vec<&Sel> = node.select.iter().filter(|s| s.agg.is_some()).collect();
+    if !agg_sels.is_empty() && agg_sels.len() != node.select.len() {
+        // PostgREST does not allow mixing aggregates with plain columns inside an embed
+        return Err(ApiError::parse(format!(
+            "cannot mix aggregates with regular columns in embed '{}'",
+            node.rel
+        )));
+    }
     if !node.select.is_empty() && agg_sels.len() == node.select.len() {
         let mut aggs: Vec<String> = Vec::new();
         for s in &agg_sels {
             let a = s.agg.as_ref().unwrap();
             let out_alias = s.alias.clone().unwrap_or_else(|| a.func.clone());
-            let expr = match (a.func.as_str(), &a.arg) {
+            let mut expr = match (a.func.as_str(), &a.arg) {
                 ("count", None) => "count(*)::bigint".to_string(),
+                ("count", Some(col)) if col == "*" => "count(*)::bigint".to_string(),
                 ("count", Some(col)) => format!("count({})", colref(&inner_alias, col)),
                 (f, Some(col)) => format!("{}({})", f, colref(&inner_alias, col)),
                 (f, None) => {
                     return Err(ApiError::parse(format!("aggregate {}() requires a column", f)))
                 }
             };
+            if let Some(c) = &s.cast {
+                expr = format!("({})::{}", expr, c);
+            }
             aggs.push(format!("{} AS {}", expr, qi(&out_alias)));
         }
         let conds = compile_conds(&node.filters, &inner_alias)?;
@@ -414,7 +465,9 @@ fn build_embed(
         }
     }
 
-    // to-one (parent) embeds: filters lift to root EXISTS
+    // to-one embeds: FK parents (filters lift to root EXISTS) and computed
+    // scalar-composite returns (filters apply inside the lateral)
+    let to_one = matches!(&cand.kind, JoinKind::Parent { .. } | JoinKind::Computed { setof: false, .. });
     if let JoinKind::Parent { child_cols, parent_cols } = &cand.kind {
         if !node.filters.is_empty() {
             let pex = format!("pex{}", en);
@@ -440,7 +493,7 @@ fn build_embed(
         }
     }
 
-    if let JoinKind::Parent { .. } = cand.kind {
+    if to_one {
         let mut wh = fk_where.clone();
         if !node.filters.is_empty() && parent_exists.is_empty() {
             let conds = compile_conds(&node.filters, &inner_alias)?;
@@ -550,6 +603,20 @@ fn colref(alias: &str, col: &str) -> String {
 }
 
 fn project_col(alias: &str, s: &Sel) -> Result<String, ApiError> {
+    let expr = project_expr(alias, s)?;
+    // `*` spreads every column of the source; `alias:*` behaves the same
+    if s.name == "*" {
+        return Ok(expr);
+    }
+    let out = s.alias.clone().unwrap_or_else(|| s.name.clone());
+    Ok(format!("{} AS {}", expr, qi(&out)))
+}
+
+/// The bare SQL expression for a select item (no output alias).
+fn project_expr(alias: &str, s: &Sel) -> Result<String, ApiError> {
+    if s.name == "*" {
+        return Ok(format!("{}.*", qi(alias)));
+    }
     let mut expr = colref(alias, &s.name);
     if let Some((k, is_text)) = &s.json {
         expr = format!(
@@ -562,8 +629,7 @@ fn project_col(alias: &str, s: &Sel) -> Result<String, ApiError> {
     if let Some(c) = &s.cast {
         expr = format!("({})::{}", expr, c);
     }
-    let out = s.alias.clone().unwrap_or_else(|| s.name.clone());
-    Ok(format!("{} AS {}", expr, qi(&out)))
+    Ok(expr)
 }
 
 fn compile_order_item(o: &OrderItem, alias: &str) -> String {
@@ -702,6 +768,172 @@ fn leaf_sql(col: &str, op: &str, val: &str, alias: &str) -> Result<String, ApiEr
     Ok(sql)
 }
 
+// ---------- mutation-return projection & RPC shaping ----------
+
+/// Outer SELECT over a `pgrest_src` CTE (mutation RETURNING *), applying the
+/// requested `select=` projection and any resource embeds.
+pub fn compile_return_read(
+    cache: &SchemaCache,
+    t: &TableInfo,
+    select: &[Sel],
+) -> Result<String, ApiError> {
+    if select.is_empty() {
+        return Ok("SELECT to_json(\"t0\") AS \"row\" FROM \"pgrest_src\" AS \"t0\"".to_string());
+    }
+    let mut aliases = AliasGen::default();
+    let mut proj: Vec<String> = Vec::new();
+    let mut joins: Vec<String> = Vec::new();
+    for s in select {
+        if let Some(node) = &s.embed {
+            let eo = build_embed(cache, t, "t0", s, node, &mut aliases, 0)?;
+            proj.extend(eo.select_exprs);
+            joins.extend(eo.joins);
+        } else {
+            proj.push(project_col("t0", s)?);
+        }
+    }
+    Ok(format!(
+        "SELECT to_json(\"x\") AS \"row\" FROM (SELECT {proj} FROM \"pgrest_src\" AS \"t0\"{joins}) \"x\"",
+        proj = proj.join(", "),
+        joins = if joins.is_empty() { String::new() } else { format!(" {}", joins.join(" ")) }
+    ))
+}
+
+/// Read-shaping parameters for setof-returning RPC calls.
+#[derive(Default)]
+pub struct RpcShape {
+    /// The SETOF target table (enables embeds + typed projection). `None` for
+    /// TABLE(...) record types, where only plain column selection works.
+    pub base: Option<TableInfo>,
+    pub select: Vec<Sel>,
+    pub conds: Vec<Cond>,
+    pub order: Vec<OrderItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// Shape a setof-returning function call: per-row JSON docs with projection,
+/// embeds, filters, order and limit/offset applied.
+pub fn compile_rpc_shaping(
+    cache: &SchemaCache,
+    call: &str,
+    sh: &RpcShape,
+) -> Result<String, ApiError> {
+    let alias = "r";
+    let from = format!("{} AS {}", call, qi(alias));
+    let any_agg = sh.select.iter().any(|s| s.agg.is_some());
+    if any_agg {
+        if sh.select.iter().any(|s| s.embed.is_some()) {
+            return Err(ApiError::parse(
+                "cannot mix aggregate functions with resource embeds in select",
+            ));
+        }
+        let mut exprs: Vec<String> = Vec::new();
+        let mut group_by: Vec<String> = Vec::new();
+        for s in &sh.select {
+            if s.agg.is_some() {
+                exprs.push(agg_expr(alias, s)?);
+            } else {
+                let bare = project_expr(alias, s)?;
+                if bare.ends_with(".*") {
+                    return Err(ApiError::parse("'*' cannot be combined with aggregates"));
+                }
+                group_by.push(bare.clone());
+                exprs.push(format!("{} AS {}", bare, qi(&s.alias.clone().unwrap_or_else(|| s.name.clone()))));
+            }
+        }
+        let wh = compile_conds(&sh.conds, alias)?;
+        let mut tail = String::new();
+        if !group_by.is_empty() {
+            tail.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+        }
+        if !sh.order.is_empty() {
+            tail.push_str(&format!(
+                " ORDER BY {}",
+                sh.order.iter().map(|o| compile_order_item(o, alias)).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if let Some(l) = sh.limit {
+            tail.push_str(&format!(" LIMIT {}", l));
+        }
+        if let Some(o) = sh.offset {
+            tail.push_str(&format!(" OFFSET {}", o));
+        }
+        return Ok(format!(
+            "SELECT to_json(\"x\") AS \"row\" FROM (SELECT {exprs} FROM {from}{wh}{tail}) \"x\"",
+            exprs = exprs.join(", "),
+            from = from,
+            wh = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) },
+            tail = tail
+        ));
+    }
+
+    let mut aliases = AliasGen::default();
+    let mut proj: Vec<String> = Vec::new();
+    let mut joins: Vec<String> = Vec::new();
+    if sh.select.is_empty() {
+        proj.push(format!("{}.*", qi(alias)));
+    } else {
+        for s in &sh.select {
+            if let Some(node) = &s.embed {
+                let base = sh.base.as_ref().ok_or_else(|| {
+                    ApiError::parse("cannot embed into a TABLE() function result")
+                })?;
+                let eo = build_embed(cache, base, alias, s, node, &mut aliases, 0)?;
+                proj.extend(eo.select_exprs);
+                joins.extend(eo.joins);
+            } else {
+                proj.push(project_col(alias, s)?);
+            }
+        }
+    }
+    let wh = compile_conds(&sh.conds, alias)?;
+    let mut tail = String::new();
+    if !sh.order.is_empty() {
+        tail.push_str(&format!(
+            " ORDER BY {}",
+            sh.order.iter().map(|o| compile_order_item(o, alias)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let Some(l) = sh.limit {
+        tail.push_str(&format!(" LIMIT {}", l));
+    }
+    if let Some(o) = sh.offset {
+        tail.push_str(&format!(" OFFSET {}", o));
+    }
+    Ok(format!(
+        "SELECT to_json(\"x\") AS \"row\" FROM (SELECT {proj} FROM {from}{joins}{wh}{tail}) \"x\"",
+        proj = proj.join(", "),
+        from = from,
+        joins = if joins.is_empty() { String::new() } else { format!(" {}", joins.join(" ")) },
+        wh = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) },
+        tail = tail
+    ))
+}
+
+/// Render the aggregate SQL expression for one select item (no alias).
+fn agg_expr_sql(alias: &str, a: &Agg) -> Result<String, ApiError> {
+    let e = match (a.func.as_str(), &a.arg) {
+        ("count", None) => "count(*)::bigint".to_string(),
+        ("count", Some(col)) if col == "*" => "count(*)::bigint".to_string(),
+        ("count", Some(col)) => format!("count({})", colref(alias, col)),
+        (f, Some(col)) => format!("{}({})", f, colref(alias, col)),
+        (f, None) => return Err(ApiError::parse(format!("aggregate {}() requires a column", f))),
+    };
+    Ok(e)
+}
+
+/// Render one aggregate select item (`count()`, `sum(col)`, aliases, casts).
+fn agg_expr(alias: &str, s: &Sel) -> Result<String, ApiError> {
+    let a = s.agg.as_ref().ok_or_else(|| ApiError::parse("not an aggregate"))?;
+    let out = s.alias.clone().unwrap_or_else(|| a.func.clone());
+    let mut e = agg_expr_sql(alias, a)?;
+    if let Some(c) = &s.cast {
+        e = format!("({})::{}", e, c);
+    }
+    Ok(format!("{} AS {}", e, qi(&out)))
+}
+
 // ---------- top-level read ----------
 
 pub fn compile_read(
@@ -711,9 +943,14 @@ pub fn compile_read(
     count: CountMode,
     max_rows: Option<i64>,
 ) -> Result<ReadSql, ApiError> {
-    let agg_sels: Vec<&Sel> = q.select.iter().filter(|s| s.agg.is_some()).collect();
-    if !agg_sels.is_empty() {
-        return compile_aggregate(t, q, &agg_sels);
+    let has_agg = q.select.iter().any(|s| s.agg.is_some());
+    if has_agg {
+        if q.select.iter().any(|s| s.embed.is_some()) {
+            return Err(ApiError::parse(
+                "cannot mix aggregate functions with resource embeds in select",
+            ));
+        }
+        return compile_aggregate(t, q);
     }
 
     let mut aliases = AliasGen::default();
@@ -796,37 +1033,88 @@ pub fn compile_read(
                 wh = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) }
             ))
         }
-        CountMode::Estimated => Some(format!(
-            "SELECT GREATEST(reltuples::bigint, 0) AS total FROM pg_class WHERE oid = '{}.{}'::regclass",
-            t.schema, t.name
-        )),
+        CountMode::Estimated => {
+            // PostgREST "planned" count: row estimate from EXPLAIN of the
+            // read query itself (limit/offset stripped, inner joins kept).
+            let inner_joins = out
+                .joins
+                .iter()
+                .filter(|j| j.starts_with("INNER"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let jsql = if inner_joins.is_empty() { String::new() } else { format!(" {}", inner_joins) };
+            Some(format!(
+                "EXPLAIN (FORMAT JSON) SELECT 1 FROM {from}{jsql}{wh}",
+                from = from,
+                jsql = jsql,
+                wh = if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) }
+            ))
+        }
     };
 
     Ok(ReadSql { count_sql, rows_sql })
 }
 
-fn compile_aggregate(t: &TableInfo, q: &Query, aggs: &[&Sel]) -> Result<ReadSql, ApiError> {
+fn compile_aggregate(t: &TableInfo, q: &Query) -> Result<ReadSql, ApiError> {
     let alias = "t0";
     let mut exprs: Vec<String> = Vec::new();
-    for s in aggs {
-        let a = s.agg.as_ref().unwrap();
-        let out = s.alias.clone().unwrap_or_else(|| a.func.clone());
-        let e = match (a.func.as_str(), &a.arg) {
-            ("count", None) => "count(*)::bigint".to_string(),
-            ("count", Some(col)) => format!("count({})", colref(alias, col)),
-            (f, Some(col)) => format!("{}({})", f, colref(alias, col)),
-            (f, None) => return Err(ApiError::parse(format!("aggregate {}() requires a column", f))),
-        };
-        exprs.push(format!("{} AS {}", e, qi(&out)));
+    let mut group_by: Vec<String> = Vec::new();
+
+    // plain columns alongside aggregates: PostgREST auto-groups by them.
+    // every output column is to_jsonb-wrapped so the JSON types survive the
+    // text protocol (numeric vs ::text vs boolean)
+    for s in &q.select {
+        if s.embed.is_some() {
+            continue; // already rejected in compile_read
+        }
+        if s.agg.is_some() {
+            let a = s.agg.as_ref().unwrap();
+            let out = s.alias.clone().unwrap_or_else(|| a.func.clone());
+            let mut e = agg_expr_sql(alias, a)?;
+            if let Some(c) = &s.cast {
+                e = format!("({})::{}", e, c);
+            }
+            exprs.push(format!("to_jsonb({}) AS {}", e, qi(&out)));
+        } else {
+            let bare = project_expr(alias, s)?;
+            if bare.ends_with(".*") {
+                return Err(ApiError::parse("'*' cannot be combined with aggregates"));
+            }
+            group_by.push(bare.clone());
+            exprs.push(format!("to_jsonb({}) AS {}", bare, qi(&s.alias.clone().unwrap_or_else(|| s.name.clone()))));
+        }
     }
+
     let wh = compile_conds(&q.conds, alias)?;
+    let mut tail = String::new();
+    if !group_by.is_empty() {
+        tail.push_str(&format!(" GROUP BY {}", group_by.join(", ")));
+    }
+    if !q.order.is_empty() {
+        tail.push_str(&format!(
+            " ORDER BY {}",
+            q.order
+                .iter()
+                .map(|o| compile_order_item(o, alias))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(l) = q.limit {
+        tail.push_str(&format!(" LIMIT {}", l));
+    }
+    if let Some(o) = q.offset {
+        tail.push_str(&format!(" OFFSET {}", o));
+    }
     let rows_sql = format!(
-        "SELECT {} FROM {}.{} AS {}{} LIMIT 1",
+        "SELECT {} FROM {}.{} AS {}{}{}",
         exprs.join(", "),
         qi(&t.schema),
         qi(&t.name),
         qi(alias),
-        if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) }
+        if wh.is_empty() { String::new() } else { format!(" WHERE {}", wh) },
+        tail
     );
     Ok(ReadSql { count_sql: None, rows_sql })
 }

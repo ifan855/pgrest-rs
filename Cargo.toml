@@ -1,6 +1,6 @@
 [package]
 name = "pgrest-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A lean PostgREST-compatible REST API server for PostgreSQL, written in Rust"
 license = "MIT"
@@ -16,6 +16,8 @@ sha2 = "0.10"
 base64 = "0.22"
 percent-encoding = "2"
 futures-util = "0.3"
+rsa = { version = "0.9", features = ["sha2"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = 3

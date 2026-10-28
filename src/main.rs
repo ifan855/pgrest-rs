@@ -24,6 +24,7 @@ pub struct App {
     pub cache: RwLock<Arc<schema::SchemaCache>>,
     pub cfg: RwLock<config::Config>,
     pub metrics: metrics::Metrics,
+    pub jwks: tokio::sync::RwLock<auth::JwksCache>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -60,6 +61,13 @@ async fn main() {
         cache: RwLock::new(Arc::new(schema::SchemaCache::default())),
         cfg: RwLock::new(cfg.clone()),
         metrics: metrics::Metrics::new(),
+        jwks: RwLock::new({
+            let mut j = auth::JwksCache::new();
+            if let Some(u) = &cfg.jwks_url {
+                j.set_url(u.clone());
+            }
+            j
+        }),
     });
 
     // initial schema cache

@@ -34,7 +34,7 @@ fn cors(mut resp: Response) -> Response {
     );
     hs.insert(
         "Access-Control-Allow-Methods",
-        HeaderValue::from_static("GET, POST, PATCH, DELETE, OPTIONS"),
+        HeaderValue::from_static("GET, POST, PATCH, PUT, DELETE, OPTIONS"),
     );
     resp
 }
@@ -117,7 +117,8 @@ async fn root_get(app: &Arc<crate::App>) -> Response {
 
 async fn admin(app: &Arc<crate::App>, segments: &[String], method: &Method) -> Response {
     if method != Method::GET && method != Method::HEAD {
-        return err_resp(ApiError::new(405, "PGRST102", "method not allowed on admin endpoints"));
+        return err_resp(ApiError::new(405, "PGRST102", "method not allowed on admin endpoints")
+            .with_details("allowed: GET, HEAD"));
     }
     match segments.get(1).map(|s| s.as_str()) {
         Some("live") => mk_response(200, vec![], "OK".into()),
@@ -153,6 +154,12 @@ struct ReqCtx {
     role: String,
     claims: Option<serde_json::Value>,
     accept_raw: Option<String>,
+    /// effective schemas (narrowed by Content-Profile / Accept-Profile)
+    schemas: Vec<String>,
+    /// the profile header value when one narrowed the schema set
+    profile: Option<String>,
+    /// original raw query string (for Content-Location echo)
+    raw_query: Option<String>,
 }
 
 struct ReqInfo {
@@ -161,6 +168,8 @@ struct ReqInfo {
     query: Option<String>,
     range: Option<headers::RangeHdr>,
     accept: Option<String>,
+    content_profile: Option<String>,
+    accept_profile: Option<String>,
 }
 
 fn req_info(req: &Request) -> ReqInfo {
@@ -172,12 +181,19 @@ fn req_info(req: &Request) -> ReqInfo {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string()),
         query: req.uri().query().map(|s| s.to_string()),
-        range: headers::parse_range(req.headers().get("Range").and_then(|v| v.to_str().ok())).ok().flatten(),
+        range: headers::parse_range(
+            req.headers().get("Range").and_then(|v| v.to_str().ok()),
+            req.headers().get("Range-Unit").and_then(|v| v.to_str().ok()),
+        )
+        .ok()
+        .flatten(),
         accept: req.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        content_profile: req.headers().get("Content-Profile").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        accept_profile: req.headers().get("Accept-Profile").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
     }
 }
 
-async fn prepare(app: &Arc<crate::App>, ri: ReqInfo) -> Result<ReqCtx, ApiError> {
+async fn prepare(app: &Arc<crate::App>, ri: ReqInfo, method: &Method) -> Result<ReqCtx, ApiError> {
     let cfg = app.cfg.read().await.clone();
     let cache = app.cache.read().await.clone();
     let prefer = ri.prefer;
@@ -186,18 +202,19 @@ async fn prepare(app: &Arc<crate::App>, ri: ReqInfo) -> Result<ReqCtx, ApiError>
     // auth
     let mut role = cfg.db_anon_role.clone();
     let mut claims = None;
+    let keys_configured = cfg.jwt_secret.is_some() || cfg.jwks_url.is_some();
     if let Some(auth) = ri.auth {
         if let Some(token) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
-            match &cfg.jwt_secret {
-                Some(secret) => {
-                    let c = crate::auth::verify_hs256(token, secret).map_err(|e| {
-                        ApiError::unauthorized().with_details(e)
-                    })?;
-                    role = crate::auth::extract_role(&c, &cfg.db_anon_role);
-                    claims = Some(c);
-                }
-                None => {
-                    // no secret configured: tokens are ignored (documented)
+            if !keys_configured {
+                // no secret and no jwks-url: tokens are ignored (documented);
+                // requests run as the anonymous role
+            } else {
+                match crate::auth::verify_token(token, &cfg, &app.jwks).await {
+                    Ok(c) => {
+                        role = crate::auth::extract_role(&c, &cfg.db_anon_role);
+                        claims = Some(c);
+                    }
+                    Err(e) => return Err(ApiError::unauthorized().with_details(e)),
                 }
             }
         } else if !auth.is_empty() {
@@ -205,13 +222,31 @@ async fn prepare(app: &Arc<crate::App>, ri: ReqInfo) -> Result<ReqCtx, ApiError>
         }
     }
 
-    Ok(ReqCtx { cfg, cache, prefer, params, role, claims, accept_raw: ri.accept })
+    // Content-Profile (writes) / Accept-Profile (reads) narrow the schema set
+    let is_read = *method == Method::GET || *method == Method::HEAD;
+    let profile = if is_read {
+        ri.accept_profile.clone().or_else(|| ri.content_profile.clone())
+    } else {
+        ri.content_profile.clone().or_else(|| ri.accept_profile.clone())
+    };
+    let schemas = match &profile {
+        Some(p) => {
+            if !cfg.db_schemas.contains(p) {
+                return Err(ApiError::not_found_relation("schema", p));
+            }
+            vec![p.clone()]
+        }
+        None => cfg.db_schemas.clone(),
+    };
+
+    Ok(ReqCtx { cfg, cache, prefer, params, role, claims, accept_raw: ri.accept, schemas, profile, raw_query: ri.query })
 }
 
 fn resolve_table<'c>(
     cache: &'c SchemaCache,
     schemas: &[String],
     segments: &[String],
+    profile: Option<&str>,
 ) -> Result<&'c TableInfo, ApiError> {
     let name = segments.last().unwrap();
     match segments.len() {
@@ -220,9 +255,13 @@ fn resolve_table<'c>(
             Err(FindErr::Missing) => Err(ApiError::not_found_relation("table", name)),
             Err(FindErr::Ambiguous) => Err(ApiError::ambiguous("table", name)),
         },
-        2 => cache
-            .table(&segments[0], &segments[1])
-            .ok_or_else(|| ApiError::not_found_relation("table", &format!("{}.{}", segments[0], segments[1]))),
+        2 => {
+            // with a profile header the profile schema wins over the path segment
+            let schema = profile.unwrap_or(&segments[0]).to_string();
+            cache
+                .table(&schema, &segments[1])
+                .ok_or_else(|| ApiError::not_found_relation("table", &format!("{}.{}", schema, segments[1])))
+        }
         _ => Err(ApiError::parse("unexpected path segments")),
     }
 }
@@ -249,8 +288,8 @@ async fn table_inner(
 ) -> Result<Response, ApiError> {
     let ri = req_info(&req);
     let range_in = ri.range.clone();
-    let ctx = prepare(&app, ri).await?;
-    let t = resolve_table(&ctx.cache, &ctx.cfg.db_schemas.as_slice(), &segments)?;
+    let ctx = prepare(&app, ri, &method).await?;
+    let t = resolve_table(&ctx.cache, ctx.schemas.as_slice(), &segments, ctx.profile.as_deref())?;
 
     // parse query grammar
     let mut q = Query {
@@ -265,8 +304,8 @@ async fn table_inner(
         match k.as_str() {
             "select" => q.select = crate::parser::parse_select(v)?,
             "order" => q.order = crate::parser::parse_order(v)?,
-            "limit" => q.limit = Some(v.parse().map_err(|_| ApiError::parse(format!("invalid limit '{}'", v)))?),
-            "offset" => q.offset = Some(v.parse().map_err(|_| ApiError::parse(format!("invalid offset '{}'", v)))?),
+            "limit" => q.limit = Some(crate::parser::parse_nonneg(v, "limit")?),
+            "offset" => q.offset = Some(crate::parser::parse_nonneg(v, "offset")?),
             "columns" | "on_conflict" => {}
             other if other.contains('.') || other == "and" || other == "or" || other.starts_with("not.") => {
                 // possibly embed-scoped or logic; routed below
@@ -299,10 +338,12 @@ async fn table_inner(
 
     match method {
         Method::GET | Method::HEAD => read_response(&app, &ctx, t, q, exec_ctx).await,
-        Method::POST => insert_response(&app, &ctx, t, &content_type, &body_str, exec_ctx, &segments).await,
+        Method::POST => insert_response(&app, &ctx, t, &content_type, &body_str, exec_ctx, &segments, &q).await,
         Method::PATCH => update_response(&app, &ctx, t, &content_type, &body_str, q, exec_ctx).await,
+        Method::PUT => put_response(&app, &ctx, t, &content_type, &body_str, q, exec_ctx).await,
         Method::DELETE => delete_response(&app, &ctx, t, q, exec_ctx).await,
-        _ => Err(ApiError::new(405, "PGRST102", "method not allowed")),
+        _ => Err(ApiError::new(405, "PGRST102", "method not allowed")
+            .with_details("allowed: GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS")),
     }
 }
 
@@ -362,7 +403,23 @@ async fn read_response(
     let mut total: Option<i64> = None;
     if read.count_sql.is_some() {
         if let Some((cols, rows)) = out.results.get(idx) {
-            if let Some(Some(v)) = rows.first().and_then(|r| {
+            // Estimated mode runs EXPLAIN (FORMAT JSON): extract "Plan Rows"
+            if cm == CountMode::Estimated {
+                let text: String = rows
+                    .iter()
+                    .filter_map(|r| r.first().cloned().flatten())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if let Some(p) = text.find("\"Plan Rows\":") {
+                    let rest = &text[p + "\"Plan Rows\":".len()..];
+                    let num: String = rest
+                        .chars()
+                        .skip_while(|c| c.is_whitespace())
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    total = num.parse::<i64>().ok();
+                }
+            } else if let Some(Some(v)) = rows.first().and_then(|r| {
                 cols.iter().position(|c| c == "total").map(|i| r.get(i).cloned())
             }) {
                 total = v.as_deref().and_then(|s| s.parse::<i64>().ok());
@@ -377,22 +434,29 @@ async fn read_response(
         .unwrap_or_else(|| (vec!["row".into()], Vec::new()));
     idx += 1;
 
-    // aggregate select (no "row" col) -> wrap as object
+    // aggregate select (no "row" col) -> object(s); GROUP BY can yield several
     let is_aggregate = !cols.is_empty() && cols[0] != "row";
     let json_rows: Vec<String> = if is_aggregate {
-        let mut m = serde_json::Map::new();
-        for (i, c) in cols.iter().enumerate() {
-            let v = rows.first().and_then(|r| r.get(i)).cloned().flatten();
-            let jv = match v {
-                None => serde_json::Value::Null,
-                Some(s) => serde_json::from_str(&s)
-                    .unwrap_or(serde_json::Value::String(s.clone())),
-            };
-            m.insert(c.clone(), jv);
-        }
-        vec![serde_json::Value::Object(m).to_string()]
+        rows.iter()
+            .map(|r| {
+                let mut m = serde_json::Map::new();
+                for (i, c) in cols.iter().enumerate() {
+                    let v = r.get(i).cloned().flatten();
+                    let jv = match v {
+                        None => serde_json::Value::Null,
+                        Some(s) => serde_json::from_str(&s)
+                            .unwrap_or(serde_json::Value::String(s.clone())),
+                    };
+                    m.insert(c.clone(), jv);
+                }
+                serde_json::Value::Object(m).to_string()
+            })
+            .collect()
     } else {
-        rows.iter().filter_map(|r| r.first().cloned().flatten()).collect()
+        rows.iter()
+            .filter_map(|r| r.first().cloned().flatten())
+            .map(compact_json)
+            .collect()
     };
 
     let media = headers::negotiate_accept(ctx.accept_raw.as_deref())
@@ -438,17 +502,13 @@ async fn read_response(
         };
         let status = if partial { 206 } else { 200 };
         if ranged {
+            // canonical URL: original query string (PostgREST echoes it back)
             let mut loc = req_path_url(&segments_of(t));
-            let mut parts: Vec<String> = Vec::new();
-            if let Some(o) = q.offset {
-                parts.push(format!("offset={}", o));
-            }
-            if let Some(l) = q.limit {
-                parts.push(format!("limit={}", l));
-            }
-            if !parts.is_empty() {
-                loc.push('?');
-                loc.push_str(&parts.join("&"));
+            if let Some(qs) = &ctx.raw_query {
+                if !qs.is_empty() {
+                    loc.push('?');
+                    loc.push_str(qs);
+                }
             }
             hdrs.push(("Content-Location", loc));
         }
@@ -552,6 +612,7 @@ async fn insert_response(
     body: &str,
     exec: ExecCtx,
     segments: &[String],
+    q: &Query,
 ) -> Result<Response, ApiError> {
     let rows = parse_body_rows(content_type, body)?;
     let columns_opt: Option<Vec<String>> = ctx
@@ -572,7 +633,17 @@ async fn insert_response(
     let missing_default = ctx.prefer.missing.as_deref() == Some("default");
     let wants_rows = ctx.prefer.ret.as_deref() == Some("representation");
 
-    let m = mutate::compile_insert(t, &rows, columns_opt.as_deref(), on_conflict.as_deref(), resolution, missing_default, wants_rows)?;
+    let m = mutate::compile_insert(
+        &ctx.cache,
+        t,
+        &rows,
+        columns_opt.as_deref(),
+        on_conflict.as_deref(),
+        resolution,
+        missing_default,
+        wants_rows,
+        &q.select,
+    )?;
     let out = pg::execute(&app.pool, &exec, &[m.sql]).await?;
 
     let mut hdrs: Vec<(&'static str, String)> = Vec::new();
@@ -585,6 +656,7 @@ async fn insert_response(
     let json_rows: Vec<String> = rws
         .iter()
         .filter_map(|r| r.first().cloned().flatten())
+        .map(compact_json)
         .collect();
 
     if !t.pks.is_empty() && json_rows.len() == 1 {
@@ -618,6 +690,18 @@ fn json_scalar_to_text(v: &serde_json::Value) -> String {
     }
 }
 
+/// Compact a JSON row document (PostgreSQL json_agg emits `[{...}, {...}]`
+/// with spaces; PostgREST responses are compact). Non-JSON text passes through.
+fn compact_json(s: String) -> String {
+    if s.starts_with('{') || s.starts_with('[') {
+        serde_json::from_str::<serde_json::Value>(&s)
+            .map(|v| v.to_string())
+            .unwrap_or(s)
+    } else {
+        s
+    }
+}
+
 async fn update_response(
     app: &Arc<crate::App>,
     ctx: &ReqCtx,
@@ -638,7 +722,7 @@ async fn update_response(
         _ => return Err(ApiError::body_required().with_details("PATCH body must be a JSON object")),
     };
     let wants_rows = ctx.prefer.ret.as_deref() == Some("representation");
-    let m = mutate::compile_update(t, &q, &obj, wants_rows)?;
+    let m = mutate::compile_update(&ctx.cache, t, &q, &obj, wants_rows, &q.select)?;
     let out = pg::execute(&app.pool, &exec, &[m.sql]).await?;
 
     let mut hdrs: Vec<(&'static str, String)> = Vec::new();
@@ -652,6 +736,7 @@ async fn update_response(
     let json_rows: Vec<String> = rws
         .iter()
         .filter_map(|r| r.first().cloned().flatten())
+        .map(compact_json)
         .collect();
     let media = headers::negotiate_accept(ctx.accept_raw.as_deref()).map_err(|e| ApiError::new(406, "PGRST115", format!("Not acceptable: {}", e)))?;
     let shaped = media::shape(&json_rows, media)?;
@@ -667,7 +752,7 @@ async fn delete_response(
     exec: ExecCtx,
 ) -> Result<Response, ApiError> {
     let wants_rows = ctx.prefer.ret.as_deref() == Some("representation");
-    let m = mutate::compile_delete(t, &q, wants_rows)?;
+    let m = mutate::compile_delete(&ctx.cache, t, &q, wants_rows, &q.select)?;
     let out = pg::execute(&app.pool, &exec, &[m.sql]).await?;
 
     let mut hdrs: Vec<(&'static str, String)> = Vec::new();
@@ -681,6 +766,50 @@ async fn delete_response(
     let json_rows: Vec<String> = rws
         .iter()
         .filter_map(|r| r.first().cloned().flatten())
+        .map(compact_json)
+        .collect();
+    let media = headers::negotiate_accept(ctx.accept_raw.as_deref()).map_err(|e| ApiError::new(406, "PGRST115", format!("Not acceptable: {}", e)))?;
+    let shaped = media::shape(&json_rows, media)?;
+    hdrs.push(("Content-Type", shaped.content_type.to_string()));
+    Ok(mk_response(200, hdrs, shaped.body))
+}
+
+/// PUT: upsert-by-primary-key (update-or-insert in one statement).
+async fn put_response(
+    app: &Arc<crate::App>,
+    ctx: &ReqCtx,
+    t: &TableInfo,
+    content_type: &str,
+    body: &str,
+    q: Query,
+    exec: ExecCtx,
+) -> Result<Response, ApiError> {
+    let ct = content_type.split(';').next().unwrap_or("").trim();
+    if ct != "application/json" && !ct.is_empty() {
+        return Err(ApiError::unsupported_media(ct));
+    }
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| ApiError::body_required().with_details(e.to_string()))?;
+    let obj = match v {
+        serde_json::Value::Object(m) => m,
+        _ => return Err(ApiError::body_required().with_details("PUT body must be a JSON object")),
+    };
+    let wants_rows = ctx.prefer.ret.as_deref() == Some("representation");
+    let m = mutate::compile_put(&ctx.cache, t, &q, &obj, wants_rows, &q.select)?;
+    let out = pg::execute(&app.pool, &exec, &[m.sql]).await?;
+
+    let mut hdrs: Vec<(&'static str, String)> = Vec::new();
+    if let Some(ap) = ctx.prefer.applied() {
+        hdrs.push(("Preference-Applied", ap));
+    }
+    if !m.wants_rows {
+        return Ok(mk_response(204, hdrs, String::new()));
+    }
+    let rws = out.results.first().map(|(_, r)| r.clone()).unwrap_or_default();
+    let json_rows: Vec<String> = rws
+        .iter()
+        .filter_map(|r| r.first().cloned().flatten())
+        .map(compact_json)
         .collect();
     let media = headers::negotiate_accept(ctx.accept_raw.as_deref()).map_err(|e| ApiError::new(406, "PGRST115", format!("Not acceptable: {}", e)))?;
     let shaped = media::shape(&json_rows, media)?;
@@ -708,25 +837,51 @@ async fn rpc_inner(
     fname: String,
     _query: Option<String>,
 ) -> Result<Response, ApiError> {
-    let ctx = prepare(&app, req_info(&req)).await?;
-    let f = match ctx.cache.find_function(&ctx.cfg.db_schemas.as_slice(), &fname) {
-        Ok(f) => f.clone(),
-        Err(FindErr::Missing) => return Err(ApiError::not_found_relation("function", &fname)),
-        Err(FindErr::Ambiguous) => return Err(ApiError::ambiguous("function", &fname)),
-    };
+    let ri = req_info(&req);
+    let ctx = prepare(&app, ri, &method).await?;
+    let candidates: Vec<crate::schema::FnInfo> =
+        match ctx.cache.find_function(ctx.schemas.as_slice(), &fname) {
+            Ok(f) => f.into_iter().cloned().collect(),
+            Err(FindErr::Missing) => return Err(ApiError::not_found_relation("function", &fname)),
+            Err(FindErr::Ambiguous) => return Err(ApiError::ambiguous("function", &fname)),
+        };
+    let cand_refs: Vec<&crate::schema::FnInfo> = candidates.iter().collect();
 
-    if method == Method::GET && f.volatile {
+    // procedures are POST-only (CALL); volatile functions cannot run via GET
+    let any_proc = candidates.iter().any(|f| f.is_procedure);
+    let is_get = method == Method::GET || method == Method::HEAD;
+    if is_get && any_proc {
+        return Err(ApiError::new(
+            405,
+            "PGRST102",
+            format!("procedure {} can only be called via POST", fname),
+        ));
+    }
+    if is_get && candidates.iter().any(|f| f.volatile) {
         return Err(ApiError::new(
             405,
             "PGRST102",
             format!("function {} is VOLATILE and can only be called via POST", fname),
         ));
     }
-    if method != Method::GET && method != Method::POST {
-        return Err(ApiError::new(405, "PGRST102", "method not allowed for RPC"));
+    if !is_get && method != Method::POST {
+        return Err(ApiError::new(405, "PGRST102", "method not allowed for RPC")
+            .with_details("allowed: GET, POST, OPTIONS"));
     }
 
-    let mut args = serde_json::Map::new();
+    // parse read-shaping from the query string (setof returns)
+    let mut shape = compiler::RpcShape::default();
+    let mut qselect: Vec<crate::ast::Sel> = Vec::new();
+    let mut qorder: Vec<crate::ast::OrderItem> = Vec::new();
+    let mut qlimit: Option<i64> = None;
+    let mut qoffset: Option<i64> = None;
+    let mut conds: Vec<crate::ast::Cond> = Vec::new();
+    let setof = candidates.iter().any(|f| {
+        matches!(&f.ret_kind, crate::schema::RetKind::SetOf(_, _) | crate::schema::RetKind::Table)
+    });
+
+    // args: POST body (or GET query params); conds: filter-shaped params
+    let mut args_list: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
     if method == Method::POST {
         let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
             .await
@@ -736,27 +891,77 @@ async fn rpc_inner(
             let v: serde_json::Value = serde_json::from_str(&body_str)
                 .map_err(|e| ApiError::body_required().with_details(e.to_string()))?;
             match v {
-                serde_json::Value::Object(m) => args = m,
+                serde_json::Value::Array(items) => {
+                    // bulk only with Prefer: params=multiple-objects
+                    if ctx.prefer.params.as_deref() != Some("multiple-objects") {
+                        return Err(ApiError::new(
+                            400,
+                            "PGRST102",
+                            "RPC body arrays require 'Prefer: params=multiple-objects'",
+                        ));
+                    }
+                    for it in items {
+                        match it {
+                            serde_json::Value::Object(m) => args_list.push(m),
+                            _ => return Err(ApiError::body_required()
+                                .with_details("array items must be objects")),
+                        }
+                    }
+                }
+                serde_json::Value::Object(m) => args_list.push(m),
                 _ => return Err(ApiError::body_required().with_details("RPC body must be a JSON object")),
             }
         }
-    } else {
-        for (k, v) in &ctx.params {
-            if !matches!(k.as_str(), "select" | "order" | "limit" | "offset" | "columns") {
-                args.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    if args_list.is_empty() {
+        args_list.push(serde_json::Map::new());
+    }
+    // GET args come from the query string; on setof returns, filter-shaped
+    // params (col.op.value) become conditions on the result instead.
+    // POST also merges query-string params (body keys take precedence).
+    for (k, v) in &ctx.params {
+        match k.as_str() {
+            "select" => qselect = crate::parser::parse_select(v)?,
+            "order" => qorder = crate::parser::parse_order(v)?,
+            "limit" => qlimit = Some(crate::parser::parse_nonneg(v, "limit")?),
+            "offset" => qoffset = Some(crate::parser::parse_nonneg(v, "offset")?),
+            "columns" | "on_conflict" => {}
+            other => {
+                let is_filter = setof
+                    && crate::parser::split_op_value(v).is_some()
+                    && !other.contains('.');
+                if is_filter {
+                    conds.push(crate::parser::parse_cond(other, v)?);
+                } else {
+                    for a in args_list.iter_mut() {
+                        a.entry(other.to_string())
+                            .or_insert_with(|| serde_json::Value::String(v.clone()));
+                    }
+                }
             }
         }
     }
+    shape.select = qselect;
+    shape.order = qorder;
+    shape.limit = qlimit;
+    shape.offset = qoffset;
+    shape.conds = conds;
+    // base table for embeds on setof results
+    for f in &candidates {
+        if let crate::schema::RetKind::SetOf(s, t) | crate::schema::RetKind::Composite(s, t) = &f.ret_kind {
+            shape.base = ctx.cache.table(s, t).cloned();
+            break;
+        }
+    }
+    let use_shape = setof
+        && args_list.len() == 1
+        && (!shape.select.is_empty()
+            || !shape.conds.is_empty()
+            || !shape.order.is_empty()
+            || shape.limit.is_some()
+            || shape.offset.is_some());
 
-    let missing: Vec<String> = f
-        .arg_names
-        .iter()
-        .filter(|a| !args.contains_key(*a))
-        .cloned()
-        .collect();
-    let _ = missing; // omitted args fall back to defaults (named notation)
-
-    let rpc = mutate::compile_rpc(&ctx.cache, &f, &args)?;
+    let rpc = mutate::compile_rpc(&ctx.cache, &cand_refs, &args_list, if use_shape { Some(&shape) } else { None })?;
 
     let tx_end = match ctx.prefer.tx.as_deref() {
         Some("rollback") => TxEnd::Rollback,
@@ -789,12 +994,20 @@ async fn rpc_inner(
     let json_rows: Vec<String> = rws
         .iter()
         .filter_map(|r| r.first().cloned().flatten())
+        .map(compact_json)
         .collect();
     let media = headers::negotiate_accept(ctx.accept_raw.as_deref()).map_err(|e| ApiError::new(406, "PGRST115", format!("Not acceptable: {}", e)))?;
-    // scalar (non-setof) returns come back as one jsonb row -> object output
-    let shaped = match &f.ret_kind {
-        crate::schema::RetKind::Scalar(_) => media::shape(&json_rows, OutMedia::Object)?,
-        _ => media::shape(&json_rows, media)?,
+    // scalar / scalar-composite returns come back as one jsonb row -> object output
+    let singular = candidates.iter().any(|f| {
+        matches!(
+            &f.ret_kind,
+            crate::schema::RetKind::Scalar(_) | crate::schema::RetKind::Composite(_, _)
+        )
+    }) && args_list.len() == 1;
+    let shaped = if singular {
+        media::shape(&json_rows, OutMedia::Object)?
+    } else {
+        media::shape(&json_rows, media)?
     };
     hdrs.push(("Content-Type", shaped.content_type.to_string()));
     Ok(mk_response(200, hdrs, shaped.body))

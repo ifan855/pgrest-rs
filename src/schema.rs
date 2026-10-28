@@ -49,7 +49,9 @@ pub struct FnInfo {
     pub schema: String,
     pub name: String,
     pub arg_names: Vec<String>, // IN/INOUT/VARIADIC names in identity order
+    pub required: usize,        // args before the first DEFAULT (must be supplied)
     pub ret_kind: RetKind,
+    pub out_cols: Vec<String>, // column names for TABLE(...) returns
     pub volatile: bool,
     pub is_procedure: bool,
 }
@@ -59,14 +61,27 @@ pub enum RetKind {
     Void,
     Scalar(String),   // type name
     Composite(String, String), // schema.table
-    SetOf(String, String),
-    Table, // returns table(...) -- treated as setof composite via OUT cols
+    SetOfScalar(String),       // SETOF <scalar type>
+    SetOf(String, String),     // SETOF schema.table
+    Table, // returns table(...) -- setof record via OUT cols
+}
+
+/// A computed relationship: a function taking exactly one table-type argument
+/// whose result is a table/setof-table, exposed as an embed relation.
+#[derive(Debug, Clone)]
+pub struct ComputedRel {
+    pub fn_schema: String,
+    pub fn_name: String,
+    pub ret_schema: String,
+    pub ret_table: String,
+    pub setof: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct SchemaCache {
     pub tables: HashMap<(String, String), TableInfo>,
-    pub functions: HashMap<(String, String), FnInfo>,
+    pub functions: HashMap<(String, String), Vec<FnInfo>>, // overloads grouped by name
+    pub computed: HashMap<(String, String), Vec<ComputedRel>>, // keyed by (arg schema, arg table)
     pub enums: HashMap<(String, String), Vec<String>>,
     pub schemas: Vec<String>,
 }
@@ -90,20 +105,27 @@ impl SchemaCache {
         }
     }
 
-    pub fn function(&self, schema: &str, name: &str) -> Option<&FnInfo> {
+    pub fn function(&self, schema: &str, name: &str) -> Option<&Vec<FnInfo>> {
         self.functions.get(&(schema.to_string(), name.to_string()))
     }
 
-    pub fn find_function(&self, schemas: &[String], name: &str) -> Result<&FnInfo, FindErr> {
+    /// All overloads of `name` across the exposed schemas, grouped per schema.
+    /// Errors when the name is missing or defined in more than one schema.
+    pub fn find_function(&self, schemas: &[String], name: &str) -> Result<Vec<&FnInfo>, FindErr> {
         let mut hits: Vec<&FnInfo> = Vec::new();
+        let mut n_schemas = 0usize;
         for s in schemas {
-            if let Some(f) = self.function(s, name) {
-                hits.push(f);
+            if let Some(fs) = self.function(s, name) {
+                n_schemas += 1;
+                for f in fs {
+                    hits.push(f);
+                }
             }
         }
-        match hits.len() {
-            0 => Err(FindErr::Missing),
-            1 => Ok(hits[0]),
+        match (hits.len(), n_schemas) {
+            (0, _) => Err(FindErr::Missing),
+            (_, 0) => Err(FindErr::Missing),
+            (_, 1) => Ok(hits),
             _ => Err(FindErr::Ambiguous),
         }
     }
@@ -124,7 +146,7 @@ FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
 LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-WHERE n.nspname = ANY({schemas}) AND c.relkind IN ('r','v','m','p')
+WHERE n.nspname = ANY({schemas}) AND c.relkind IN ('r','v','m','p','f')
 ORDER BY n.nspname, c.relname, a.attnum
 "#;
 
@@ -150,9 +172,7 @@ const FUNCTION_SQL: &str = r#"
 SELECT n.nspname, p.proname, p.prokind, p.provolatile,
        pg_get_function_identity_arguments(p.oid) AS args,
        pg_get_function_result(p.oid) AS ret,
-       (SELECT coalesce(array_agg(a.attname), '{}')
-          FROM unnest(p.proallargtypes) WITH ORDINALITY AS at(t, i)
-          JOIN pg_attribute a ON false) IS NULL AS plain,
+       pg_get_function_arguments(p.oid) AS all_args,
        p.proargnames
 FROM pg_proc p
 JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -166,6 +186,31 @@ JOIN pg_enum e ON e.enumtypid = t.oid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname = ANY({schemas})
 GROUP BY 1,2
+"#;
+
+// Computed relationships: functions with EXACTLY one argument whose type is a
+// table (composite) in the exposed schemas, returning a table or setof table
+// in the exposed schemas. Exposed as embed relations named after the function.
+// The argument type is the table's ROWTYPE oid, routed through pg_type.typrelid.
+const COMPUTED_SQL: &str = r#"
+SELECT fn.nspname AS fn_schema, p.proname,
+       an.nspname AS arg_schema, at.relname AS arg_table,
+       rn.nspname AS ret_schema, rt.relname AS ret_table,
+       (pg_get_function_result(p.oid) LIKE 'SETOF %') AS setof
+FROM pg_proc p
+JOIN pg_namespace fn ON fn.oid = p.pronamespace
+JOIN pg_type argty ON argty.oid = p.proargtypes[0]
+JOIN pg_class at ON at.oid = argty.typrelid
+JOIN pg_namespace an ON an.oid = at.relnamespace
+JOIN pg_class rt ON rt.oid = COALESCE(to_regclass(regexp_replace(pg_get_function_result(p.oid), '^SETOF ', '')), 0)
+JOIN pg_namespace rn ON rn.oid = rt.relnamespace
+WHERE fn.nspname = ANY({schemas})
+  AND an.nspname = ANY({schemas})
+  AND rn.nspname = ANY({schemas})
+  AND at.relkind IN ('r','v','m','p','f')
+  AND rt.relkind IN ('r','v','m','p','f')
+  AND cardinality(p.proargtypes) = 1
+  AND p.prokind = 'f'
 "#;
 
 
@@ -322,7 +367,8 @@ pub async fn load(
         let prokind: i8 = r.get(2);
         let provolatile: i8 = r.get(3);
         let args: String = r.get(4);
-        let ret: String = r.get(5);
+        let ret: Option<String> = r.get(5); // NULL for procedures
+        let all_args: String = r.get(6); // includes DEFAULT clauses
         let proargnames: Option<Vec<String>> = r.get(7);
 
         // identity args: "a int, b text DEFAULT 1" -> names a, b (skip OUTs: identity args are IN/INOUT/VARIADIC only)
@@ -349,33 +395,88 @@ pub async fn load(
                 arg_names = names.iter().take(arg_names.len()).cloned().collect();
             }
         }
+        // identity args omit DEFAULT clauses; count them from the full
+        // signature instead (defaults are always trailing in PostgreSQL)
+        let (total_args, defaults) = scan_args_and_defaults(&all_args);
+        let required = arg_names
+            .len()
+            .saturating_sub(defaults)
+            .min(arg_names.len());
+        let _ = total_args;
 
-        let ret_kind = if ret == "void" {
-            RetKind::Void
-        } else if let Some((s, t)) = split_qualified(&ret) {
-            if ret.starts_with("SETOF ") {
-                RetKind::SetOf(s, t)
-            } else if cache.tables.contains_key(&(s.clone(), t.clone())) {
-                RetKind::Composite(s, t)
+        let ret = ret.unwrap_or_default();
+        let (ret_kind, out_cols) = if ret.is_empty() {
+            (RetKind::Void, Vec::new())
+        } else if ret == "void" {
+            (RetKind::Void, Vec::new())
+        } else if let Some(inner) = ret.strip_prefix("TABLE(") {
+            // TABLE(a numeric, b bigint) -- setof record; OUT column names are usable
+            let inner = inner.strip_suffix(')').unwrap_or(inner);
+            let cols = split_top_level_commas(inner)
+                .into_iter()
+                .filter_map(|c| {
+                    let c = c.trim();
+                    if c.is_empty() {
+                        None
+                    } else {
+                        // name type / mode name type
+                        let first = c.split_whitespace().next().unwrap_or(c);
+                        if matches!(first.to_uppercase().as_str(), "IN" | "OUT" | "INOUT" | "VARIADIC") {
+                            c.split_whitespace().nth(1).map(|s| s.to_string())
+                        } else {
+                            Some(first.to_string())
+                        }
+                    }
+                })
+                .collect();
+            (RetKind::Table, cols)
+        } else if let Some(base) = ret.strip_prefix("SETOF ") {
+            if let Some((s, t)) = split_qualified(&format!("SETOF {}", base)) {
+                (RetKind::SetOf(s, t), Vec::new())
             } else {
-                RetKind::Scalar(ret.clone())
+                (RetKind::SetOfScalar(base.trim_matches('"').to_string()), Vec::new())
+            }
+        } else if let Some((s, t)) = split_qualified(&ret) {
+            if cache.tables.contains_key(&(s.clone(), t.clone())) {
+                (RetKind::Composite(s, t), Vec::new())
+            } else {
+                (RetKind::Scalar(ret.clone()), Vec::new())
             }
         } else {
-            RetKind::Scalar(ret.clone())
+            (RetKind::Scalar(ret.clone()), Vec::new())
         };
 
         let key = (schema.clone(), name.clone());
-        cache.functions.insert(
-            key,
-            FnInfo {
-                schema,
-                name,
-                arg_names,
-                ret_kind,
-                volatile: (provolatile as u8 as char) == 'v',
-                is_procedure: (prokind as u8 as char) == 'p',
-            },
-        );
+        cache.functions.entry(key).or_default().push(FnInfo {
+            schema,
+            name,
+            arg_names,
+            required,
+            ret_kind,
+            out_cols,
+            volatile: (provolatile as u8 as char) == 'v',
+            is_procedure: (prokind as u8 as char) == 'p',
+        });
+    }
+
+    // computed relationships
+    let rows = client
+        .query(&COMPUTED_SQL.replace("{schemas}", &list), &[])
+        .await
+        .map_err(ApiError::from_db)?;
+    for r in rows {
+        let fn_schema: String = r.get(0);
+        let fn_name: String = r.get(1);
+        let arg_schema: String = r.get(2);
+        let arg_table: String = r.get(3);
+        let ret_schema: String = r.get(4);
+        let ret_table: String = r.get(5);
+        let setof: bool = r.get(6);
+        cache
+            .computed
+            .entry((arg_schema, arg_table))
+            .or_default()
+            .push(ComputedRel { fn_schema, fn_name, ret_schema, ret_table, setof });
     }
 
     // enums
@@ -393,8 +494,74 @@ pub async fn load(
     Ok(cache)
 }
 
+/// Count top-level argument separators and DEFAULT clauses in a full
+/// function signature, ignoring commas/keywords inside string literals.
+fn scan_args_and_defaults(sig: &str) -> (usize, usize) {
+    let mut commas = 0usize;
+    let mut defaults = 0usize;
+    let mut in_q = false;
+    let mut depth = 0usize;
+    let bytes = sig.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_q {
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_q = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_q = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => commas += 1,
+            'D' | 'd' if depth == 0 && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) => {
+                if sig[i..].len() >= 7 && sig[i..i + 7].eq_ignore_ascii_case("DEFAULT") {
+                    let after = bytes.get(i + 7);
+                    if after.map(|b| !b.is_ascii_alphanumeric()).unwrap_or(true) {
+                        defaults += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let total = if sig.trim().is_empty() { 0 } else { commas + 1 };
+    (total, defaults)
+}
+
 fn split_qualified(s: &str) -> Option<(String, String)> {
     let s = s.strip_prefix("SETOF ")?.trim();
     let (a, b) = s.split_once('.')?;
     Some((a.trim_matches('"').to_string(), b.trim_matches('"').to_string()))
+}
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
 }

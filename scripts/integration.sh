@@ -130,6 +130,96 @@ echo "== CORS + OPTIONS =="
 OPT=$(curl -s -D- -o /dev/null -X OPTIONS "$BASE/api/films" | grep -i access-control-allow-origin)
 check "options cors" '*' "$OPT"
 
+echo "== SELECT SPREAD + AGGREGATE GROUPING =="
+STAR=$(curl -sg "$BASE/api/films?select=*&title=eq.Dune")
+check "select=*" '"tags":["scifi","desert"]' "$STAR"
+STARE=$(curl -sg "$BASE/api/films?select=*,reviews(count)&title=eq.Dune")
+check "select=*,embed" '"reviews":[{"count":1}]' "$STARE"
+GRP=$(curl -sg "$BASE/api/films?select=director_id,count()&order=director_id")
+check "aggregate group by" '{"count":2,"director_id":1}' "$GRP"
+ACAST=$(curl -sg "$BASE/api/films?select=total:count()::text")
+check "aggregate cast" '"total":"4"' "$ACAST"
+AMIX=$(curl -sg "$BASE/api/films?select=count(),avg(rating)")
+check "multi aggregate" '"count":4' "$AMIX"
+check "mix agg+embed rejected" '400' "$(curl -s -o /dev/null -w '%{http_code}' -g "$BASE/api/films?select=count(),reviews(stars)")"
+check "mix agg in embed rejected" '400' "$(curl -s -o /dev/null -w '%{http_code}' -g "$BASE/api/films?select=title,reviews(count,stars)")"
+
+echo "== PUT (upsert by pk) =="
+PUTU=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$BASE/api/directors?id=eq.1" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"id":1,"name":"Nolan"}')
+check "put update 200" '200' "$PUTU"
+PUTI=$(curl -s -w "|%{http_code}" -X PUT "$BASE/api/directors?id=eq.9" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"id":9,"name":"Wachowski"}')
+check "put insert 200" '[{"id":9,"name":"Wachowski"}]|200' "$PUTI"
+check "put without pk filter 400" '400' "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/api/directors" -H "Content-Type: application/json" -d '{"id":1,"name":"x"}')"
+check "put without pk in body 400" '400' "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/api/directors?id=eq.1" -H "Content-Type: application/json" -d '{"name":"x"}')"
+
+echo "== MUTATION SELECT/EMBED RETURN =="
+MSEL=$(curl -s -X POST "$BASE/api/reviews?select=id,stars" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"film_id":1,"body":"msel","stars":3}')
+check "mutation select projection" '"id"' "$MSEL"
+check "mutation projection excludes others" '0' "$(echo "$MSEL" | grep -c body; true)"
+MEMB=$(curl -s -X POST "$BASE/api/films?select=title,director:directors!director_id(name)" -H "Content-Type: application/json" -H "Prefer: return=representation" -d '{"title":"Tenet","director_id":1,"year":2020}')
+check "mutation embed return" '"director":{"name":"Nolan"}' "$MEMB"
+MDEL=$(curl -s -X DELETE "$BASE/api/films?select=title&title=eq.Tenet" -H "Prefer: return=representation")
+check "delete embed return" '"title":"Tenet"' "$MDEL"
+
+echo "== RPC: SHAPING, BULK, PROCEDURES, OVERLOADS =="
+RSEL=$(curl -sg "$BASE/rpc/films_by_year?min_year=2021&select=title")
+check "rpc setof select" '[{"title":"Dune"},{"title":"Barbie"}]' "$RSEL"
+REMB=$(curl -sg "$BASE/rpc/films_by_year?min_year=2021&select=title,director:directors!director_id(name)")
+check "rpc setof embed" '"director":{"name":"Villeneuve"}' "$REMB"
+RFIL=$(curl -sg "$BASE/rpc/films_by_year?min_year=2010&title=eq.Dune&select=title")
+check "rpc setof filter" '[{"title":"Dune"}]' "$RFIL"
+RORD=$(curl -sg "$BASE/rpc/films_by_year?min_year=2010&order=year.desc&limit=1&select=title")
+check "rpc setof order+limit" '[{"title":"Barbie"}]' "$RORD"
+BULK=$(curl -s -X POST "$BASE/rpc/add" -H "Content-Type: application/json" -H "Prefer: params=multiple-objects" -d '[{"a":1,"b":2},{"a":3,"b":4}]')
+check "bulk rpc multiple-objects" '[3,7]' "$BULK"
+BULKT=$(curl -s -X POST "$BASE/rpc/hello" -H "Content-Type: application/json" -H "Prefer: params=multiple-objects" -d '[{"name":"a"},{"name":"b"}]')
+check "bulk rpc scalar text" '["hello, a","hello, b"]' "$BULKT"
+PROC=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/rpc/spin" -H "Content-Type: application/json" -d "{}")
+check "procedure call 204" '204' "$PROC"
+check "procedure get 405" '405' "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/rpc/spin")"
+OV1=$(curl -s -X POST "$BASE/rpc/hello" -H "Content-Type: application/json" -d '{"name":"rust"}')
+check "overload 1-arg" 'hello, rust' "$OV1"
+OV2=$(curl -s -X POST "$BASE/rpc/hello" -H "Content-Type: application/json" -d '{"name":"rust","greeting":"yo"}')
+check "overload 2-arg" 'yo, rust' "$OV2"
+OVA=$(curl -sg "$BASE/rpc/hello?name=q&greeting=z")
+check "overload via query" 'z, q' "$OVA"
+RSET=$(curl -s -H "Accept: application/vnd.pgrst.object+json" -g "$BASE/rpc/films_by_year?min_year=2010&select=title" -o /dev/null -w "%{http_code}")
+check "rpc setof object multi 406" '406' "$RSET"
+
+echo "== COMPUTED RELATIONSHIPS =="
+COMP=$(curl -sg "$BASE/api/directors?select=name,films_of(title)&id=eq.1")
+check "computed embed" '"films_of":[{"title":"Inception"},{"title":"Interstellar"}]' "$COMP"
+COMPF=$(curl -sg "$BASE/api/directors?select=name,films_of(title)&id=eq.1&films_of.year=eq.2014")
+check "computed embed filter" '"films_of":[{"title":"Interstellar"}]' "$COMPF"
+
+echo "== PROFILES =="
+PROF=$(curl -sg "$BASE/api/films?select=title" -H "Accept-Profile: api2")
+check "accept-profile" '[{"title":"Alt Film"}]' "$PROF"
+PROFW=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/films?select=id" -H "Content-Profile: api2" -H "Content-Type: application/json" -d '{"id":2,"title":"Second"}')
+check "content-profile write" '201' "$PROFW"
+PROFBAD=$(curl -s -o /dev/null -w "%{http_code}" -g "$BASE/api/films?select=title" -H "Accept-Profile: nosuch")
+check "bad profile 404" '404' "$PROFBAD"
+check "content-profile delete" '204' "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/api2/films?id=eq.2" -H 'Content-Profile: api2')"
+
+echo "== GRAMMAR VALIDATION + COUNTS + RANGE =="
+check "order garbage 400 PGRST100" 'PGRST100' "$(curl -sg "$BASE/api/films?order=id.bogus")"
+check "limit negative 400" '400' "$(curl -s -o /dev/null -w '%{http_code}' -g "$BASE/api/films?limit=-1")"
+check "count(*)" '"count":4' "$(curl -sg "$BASE/api/films?select=count(*)")"
+PLN=$(curl -s -D- -o /dev/null -H "Prefer: count=planned" "$BASE/api/films?select=title&limit=1" | grep -i content-range)
+check "planned count" 'items 0-0/' "$PLN"
+RU=$(curl -s -D- -o /dev/null -H "Range: 0-1" -H "Range-Unit: items" "$BASE/api/films?select=title" | grep -i "^content-range")
+check "range-unit form" 'items 0-1' "$RU"
+CL=$(curl -s -D- -o /dev/null -g "$BASE/api/films?select=title&order=id&limit=2" | grep -i "^content-location")
+check "content-location full" 'select=title&order=id&limit=2' "$CL"
+OBJ0=$(curl -s -o /dev/null -w "%{http_code}" -H "Accept: application/vnd.pgrst.object+json" "$BASE/api/films?select=title&title=eq.NOPE")
+check "object zero rows 406" '406' "$OBJ0"
+LEFT=$(curl -sg "$BASE/api/films?select=title,actors!left(name)&title=eq.Dune")
+check "!left hint" '"actors":[{"name":"Chalamet"}]' "$LEFT"
+NEST=$(curl -sg "$BASE/api/films?select=title,reviews(stars)&reviews.order=stars.desc&reviews.limit=1&title=eq.Inception")
+check "nested embed params" '"stars":5' "$NEST"
+ALIASP=$(curl -sg "$BASE/api/films?select=title,r:directors!director_id(name)&title=eq.Dune&r.name=eq.Villeneuve")
+check "embed alias param" '"r":{"name":"Villeneuve"}' "$ALIASP"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]
