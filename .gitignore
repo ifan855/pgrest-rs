@@ -1,0 +1,6 @@
+/target
+/tools
+/pgdata
+/pglog
+*.tar.gz
+*.log

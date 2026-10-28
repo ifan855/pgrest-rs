@@ -1,0 +1,24 @@
+[package]
+name = "pgrest-rs"
+version = "0.2.0"
+edition = "2021"
+description = "A lean PostgREST-compatible REST API server for PostgreSQL, written in Rust"
+license = "MIT"
+
+[dependencies]
+axum = { version = "=0.7.9", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "time"] }
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+percent-encoding = "2"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
